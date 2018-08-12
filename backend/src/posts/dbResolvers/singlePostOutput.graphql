@@ -1,0 +1,6 @@
+## Pass back the result from DynamoDB. **
+$util.toJson(
+{
+	"id": $ctx.result.postID,
+    "title": $ctx.result.title
+})

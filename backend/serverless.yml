@@ -1,0 +1,282 @@
+service:
+  name: aws-graphql-cognito
+
+provider:
+  name: aws
+  runtime: nodejs8.10
+  stage: ${self:custom.stage}
+  region: ${self:custom.region}
+  iamRoleStatements: # permissions for all of your functions can be set here
+    - Effect: Allow
+      Action: # Gives permission to DynamoDB tables in a specific region
+        - dynamodb:DescribeTable
+        - dynamodb:Query
+        - dynamodb:Scan
+        - dynamodb:GetItem
+        - dynamodb:PutItem
+        - dynamodb:UpdateItem
+        - dynamodb:DeleteItem
+      Resource: 
+        Fn::Join:
+          - ""
+          - - Fn::GetAtt: ['myDatabase', 'Arn']
+            - "*"
+
+custom:
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'ap-southeast-2'}
+  requestMap:
+    start: '{
+    "version" : "2017-02-28",
+    "operation": "Invoke",
+    "payload": {
+      "context": $util.toJson($context),
+    '
+    end: '
+        }
+    }'
+  resources:
+    prefix: ${self:service}-${self:custom.stage}
+    databaseName: db
+    graphQLAPIName: api
+    userpoolName: userpool
+    identityPoolName: idp
+    clientName: webclient
+    graphQLDBDataSourceName: posts-ds
+    graphQLLambdaDataSourceName: posts-lambda
+    databaseGSIName: userGSI
+
+functions:
+  postResolver:
+    handler: src/posts/lambdaResolvers/post.handler
+
+resources:
+
+  Resources:
+
+    myDatabase:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        GlobalSecondaryIndexes: 
+          - 
+            IndexName: ${self:custom.resources.databaseGSIName}
+            KeySchema: 
+              - 
+                AttributeName: "userID"
+                KeyType: "HASH"
+            Projection:
+              ProjectionType: "ALL"
+            ProvisionedThroughput: 
+              ReadCapacityUnits: 5
+              WriteCapacityUnits: 5
+        AttributeDefinitions:
+          -
+            AttributeName: "postID"
+            AttributeType: "S"
+          -
+            AttributeName: "userID"
+            AttributeType: "S"
+        KeySchema:
+          -
+            AttributeName: "postID"
+            KeyType: "HASH"
+          -
+            AttributeName: "userID"
+            KeyType: "RANGE"
+        ProvisionedThroughput:
+          ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+        TableName: ${self:custom.resources.prefix}-${self:custom.resources.databaseName}
+
+    graphQLAPI:
+      Type: AWS::AppSync::GraphQLApi
+      Properties:
+        UserPoolConfig: 
+          UserPoolId: 
+            Ref: myUserPool
+          AwsRegion: ${self:custom.region}
+          DefaultAction: 'ALLOW'
+        Name: ${self:custom.resources.prefix}-${self:custom.resources.graphQLAPIName}
+        AuthenticationType: 'AMAZON_COGNITO_USER_POOLS'
+
+    graphQLSchema:
+      Type: AWS::AppSync::GraphQLSchema
+      Properties:
+        Definition: "${file(./src/definitions.graphql)}"
+        ApiId: 
+          Fn::GetAtt: ['graphQLAPI', 'ApiId']
+    
+    graphQLDataSourceRole: 
+      Type: "AWS::IAM::Role"
+      Properties: 
+        AssumeRolePolicyDocument: 
+          Version: "2012-10-17"
+          Statement: 
+            - 
+              Effect: "Allow"
+              Principal: 
+                Service: 
+                  - "appsync.amazonaws.com"
+              Action: 
+                - "sts:AssumeRole"
+        Path: "/"
+        Policies: 
+          - 
+            PolicyName: "root"
+            PolicyDocument: 
+              Version: "2012-10-17"
+              Statement: 
+                - 
+                  Effect: "Allow"
+                  Action: "*"
+                  Resource:
+                    Fn::Join:
+                      - ""
+                      - - Fn::GetAtt: ['myDatabase', 'Arn']
+                        - "*"
+                - 
+                  Effect: "Allow"
+                  Action: "*"
+                  Resource: 
+                    Fn::GetAtt: ['PostResolverLambdaFunction', 'Arn']
+    
+    graphQLLambdaDatasource:
+      Type: "AWS::AppSync::DataSource"
+      DependsOn: ['PostResolverLambdaFunction', 'graphQLAPI', 'graphQLDataSourceRole']
+      Properties:
+        Type: "AWS_LAMBDA"
+        Description: "storage for posts for the graphql example"
+        LambdaConfig: 
+          LambdaFunctionArn: 
+            Fn::GetAtt: ['PostResolverLambdaFunction', 'Arn']
+        ApiId: 
+          Fn::GetAtt: ['graphQLAPI', 'ApiId']
+        ServiceRoleArn: 
+          Fn::GetAtt: ['graphQLDataSourceRole', 'Arn']
+        Name: 
+          Fn::Join:
+            - "_"
+            - Fn::Split:
+              - "-"
+              - ${self:custom.resources.prefix}-${self:custom.resources.graphQLLambdaDataSourceName}
+      
+    graphQLDBDatasource:
+      Type: "AWS::AppSync::DataSource"
+      DependsOn: ['myDatabase', 'graphQLAPI', 'graphQLDataSourceRole']
+      Properties:
+        Type: "AMAZON_DYNAMODB"
+        Description: "storage for posts"
+        ApiId: 
+          Fn::GetAtt: ['graphQLAPI', 'ApiId']
+        ServiceRoleArn: 
+          Fn::GetAtt: ['graphQLDataSourceRole', 'Arn']
+        Name: 
+          Fn::Join:
+            - "_"
+            - Fn::Split:
+              - "-"
+              - ${self:custom.resources.prefix}-${self:custom.resources.graphQLDBDataSourceName}
+        DynamoDBConfig: 
+          TableName: ${self:custom.resources.prefix}-${self:custom.resources.databaseName}
+          AwsRegion: ${self:custom.region}
+          UseCallerCredentials: True
+
+    graphQLResolverPutPost:
+      Type: "AWS::AppSync::Resolver"
+      DependsOn: graphQLDBDatasource
+      Properties:
+        TypeName: "Mutation"
+        DataSourceName: 
+          Fn::Join:
+            - "_"
+            - Fn::Split:
+              - "-"
+              - ${self:custom.resources.prefix}-${self:custom.resources.graphQLDBDataSourceName}
+        RequestMappingTemplate: "${file(./src/posts/dbResolvers/putPostInput.graphql)}"
+        ResponseMappingTemplate: "${file(./src/posts/dbResolvers/singlePostOutput.graphql)}"
+        ApiId: 
+          Fn::GetAtt: ['graphQLAPI', 'ApiId']
+        FieldName: "putPost" 
+    
+    graphQLResolverGetPost:
+      Type: "AWS::AppSync::Resolver"
+      DependsOn: graphQLDBDatasource
+      Properties:
+        TypeName: "Query"
+        DataSourceName: 
+          Fn::Join:
+            - "_"
+            - Fn::Split:
+              - "-"
+              - ${self:custom.resources.prefix}-${self:custom.resources.graphQLDBDataSourceName}
+        RequestMappingTemplate: "${file(./src/posts/dbResolvers/singlePostInput.graphql)}"
+        ResponseMappingTemplate: "${file(./src/posts/dbResolvers/singlePostOutput.graphql)}"
+        ApiId: 
+          Fn::GetAtt: ['graphQLAPI', 'ApiId']
+        FieldName: "singlePost" 
+
+    graphQLResolverListPosts:
+      Type: "AWS::AppSync::Resolver"
+      DependsOn: graphQLLambdaDatasource
+      Properties:
+        TypeName: "Query"
+        DataSourceName: 
+          Fn::Join:
+            - "_"
+            - Fn::Split:
+              - "-"
+              - ${self:custom.resources.prefix}-${self:custom.resources.graphQLLambdaDataSourceName}
+        RequestMappingTemplate: 
+          Fn::Join:
+            - ""
+            - - "${self:custom.requestMap.start}"
+              - '
+                "action": "listPosts",
+                "params": {
+                  "TableName": "${self:custom.resources.prefix}-${self:custom.resources.databaseName}",
+                  "IndexName": "${self:custom.resources.databaseGSIName}",
+                }
+              '
+              - "${self:custom.requestMap.end}"
+        ResponseMappingTemplate: "${file(./src/posts/lambdaResolvers/lambdaOutput.graphql)}"
+        ApiId: 
+          Fn::GetAtt: ['graphQLAPI', 'ApiId']
+        FieldName: "listPosts" 
+
+    myUserPool:
+      Type: AWS::Cognito::UserPool
+      Properties:
+        Policies:
+          PasswordPolicy:
+            MinimumLength: 8
+            RequireLowercase: True
+            RequireNumbers: False
+            RequireSymbols: False
+            RequireUppercase: False
+        UserPoolName: ${self:custom.resources.prefix}-${self:custom.resources.userpoolName}
+    
+    myWebClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+          ClientName: ${self:custom.resources.prefix}-${self:custom.resources.clientName}
+          UserPoolId: 
+            Ref: myUserPool
+
+  Outputs:
+    region:
+      Description: Region for all the resources
+      Value: ${self:custom.region}
+    userPoolId:
+      Description: The ClientID for the frontend
+      Value:
+        Ref: myUserPool
+    userPoolWebClientId:
+      Description: The ClientID for the frontend
+      Value:
+        Ref: myWebClient
+    awsAppsyncGraphqlEndpoint:
+      Description: The ClientID for the frontend
+      Value:
+        Fn::GetAtt: ['graphQLAPI', 'GraphQLUrl']
+
+    
